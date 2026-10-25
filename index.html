@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Power Reset</title>
+<style>
+  :root { --bg:#0f1419; --card:#1a212b; --text:#e6edf3; --muted:#8b98a5;
+          --ok:#2ecc71; --warn:#f5a623; --bad:#e5484d; --btn:#2f6feb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+         background:var(--bg); color:var(--text); min-height:100vh;
+         padding: max(16px, env(safe-area-inset-top)) 16px 24px; }
+  h1 { margin:0 0 4px; font-size:1.4rem; }
+  .sub { color:var(--muted); font-size:.9rem; margin-bottom:20px; }
+  .grid { display:grid; gap:16px; }
+  .card { background:var(--card); border-radius:14px; padding:20px; }
+  .head { display:flex; align-items:center; gap:14px; margin-bottom:16px; }
+  .light { width:28px; height:28px; border-radius:50%; background:#444; flex:none;
+           box-shadow:0 0 0 3px rgba(255,255,255,.06); }
+  .light.open   { background:var(--ok);   box-shadow:0 0 14px var(--ok); }
+  .light.closed { background:var(--warn); box-shadow:0 0 14px var(--warn); }
+  .light.err    { background:var(--bad);  box-shadow:0 0 14px var(--bad); }
+  .name { font-size:1.2rem; font-weight:600; }
+  .state { color:var(--muted); font-size:.9rem; }
+  button { width:50%; border:0; border-radius:10px; background:var(--btn); color:#fff;
+           font-size:1rem; font-weight:600; padding:14px; cursor:pointer; }
+  button:disabled { background:#3a4350; color:#8b98a5; cursor:not-allowed; }
+  #msg { margin-top:18px; min-height:1.4em; color:var(--muted); font-size:.9rem; }
+  #msg.error { color:var(--bad); }
+
+  /* Layout is chosen by JS (data-device on <body>) */
+  body[data-device="desktop"] .wrap { max-width:760px; margin:40px auto; }
+  body[data-device="desktop"] .grid { grid-template-columns:1fr 1fr; }
+  body[data-device="desktop"] button { padding:12px; }
+
+  body[data-device="phone"] .grid { grid-template-columns:1fr; }
+  body[data-device="phone"] .card { padding:22px; }
+  body[data-device="phone"] .light { width:36px; height:36px; }
+  body[data-device="phone"] .name { font-size:1.4rem; }
+  body[data-device="phone"] button { font-size:1.2rem; padding:20px; border-radius:14px; }
+</style>
+</head>
+<body data-device="desktop">
+<div class="wrap">
+  <h1>Power Reset</h1>
+  <div class="sub">Green = open (normal, power on) &middot; Amber = closed (reset in progress)</div>
+  <div class="grid" id="grid"></div>
+  <div id="msg"></div>
+</div>
+
+<script>
+const RELAYS = [{id:1, name:'Server'}, {id:2, name:'Posi'}];
+let busy = false;
+
+// --- Device detection: phone vs computer ---
+function detectDevice() {
+  const ua = /Android|iPhone|iPod|Mobile/i.test(navigator.userAgent);
+  const touchSmall = matchMedia('(pointer: coarse)').matches && Math.min(screen.width, screen.height) < 700;
+  const narrow = window.innerWidth < 600;
+  const device = (ua || touchSmall || narrow) ? 'phone' : 'desktop';
+  document.body.dataset.device = device;
+}
+detectDevice();
+addEventListener('resize', detectDevice);
+
+// --- UI ---
+const grid = document.getElementById('grid');
+const msg = document.getElementById('msg');
+for (const r of RELAYS) {
+  grid.insertAdjacentHTML('beforeend', `
+    <div class="card">
+      <div class="head">
+        <div class="light" id="light${r.id}"></div>
+        <div><div class="name">${r.name}</div><div class="state" id="state${r.id}">checking...</div></div>
+      </div>
+      <button id="btn${r.id}" onclick="restart(${r.id})">Restart ${r.name}</button>
+    </div>`);
+}
+
+function setMsg(text, isErr) { msg.textContent = text || ''; msg.className = isErr ? 'error' : ''; }
+
+function render(relays) {
+  for (const r of relays) {
+    document.getElementById('light' + r.id).className = 'light ' + (r.closed ? 'closed' : 'open');
+    document.getElementById('state' + r.id).textContent = r.closed ? 'CLOSED' : 'OPEN';
+  }
+}
+
+function renderError() {
+  for (const r of RELAYS) {
+    document.getElementById('light' + r.id).className = 'light err';
+    document.getElementById('state' + r.id).textContent = 'no response';
+  }
+}
+
+function setButtons(disabled) {
+  for (const r of RELAYS) document.getElementById('btn' + r.id).disabled = disabled;
+}
+
+async function refresh() {
+  try {
+    const res = await fetch('/api/status', {cache:'no-store'});
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'status failed');
+    render(data.relays);
+    if (!busy) setButtons(data.busy);
+  } catch (e) {
+    renderError();
+  }
+}
+
+async function restart(id) {
+  const name = RELAYS.find(r => r.id === id).name;
+  if (!confirm(`Restart ${name}? This cuts its power for about a second.`)) return;
+
+  busy = true;
+  setButtons(true);
+  setMsg(`Restarting ${name}...`);
+  try {
+    const headers = {};
+    const pin = sessionStorage.getItem('pin');
+    if (pin) headers['x-pin'] = pin;
+    let res = await fetch('/api/restart/' + id, {method:'POST', headers});
+    if (res.status === 401) {
+      const entered = prompt('Enter PIN');
+      if (!entered) throw new Error('PIN required');
+      sessionStorage.setItem('pin', entered);
+      res = await fetch('/api/restart/' + id, {method:'POST', headers:{'x-pin': entered}});
+    }
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'restart failed');
+    render(data.relays);
+    setMsg(`${name} restart complete.`);
+  } catch (e) {
+    setMsg(e.message, true);
+  } finally {
+    busy = false;
+    setButtons(false);
+    refresh();
+  }
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
